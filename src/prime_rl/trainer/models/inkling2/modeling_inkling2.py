@@ -524,7 +524,7 @@ class Inkling2Model(Inkling2PreTrainedModel):
                 cu_seqlens,
                 doc_ids,
                 block_masks,
-                routed_experts[:, :, layer_idx] if routed_experts is not None else None,
+                routed_experts[:, :, layer_idx].contiguous() if routed_experts is not None else None,
             )
 
         hidden_states = self.final_input(self.attn_res.output_query, block_states, hidden_states)[..., 0, :]
