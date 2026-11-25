@@ -55,7 +55,7 @@ def make_trained(seed: int) -> tuple[nn.Module, torch.optim.Optimizer]:
 def save(manager: CheckpointManager, *steps: int, clean: bool = False) -> None:
     model, optimizer = make_trained(seed=0)
     for step in steps:
-        manager.save(step, model, [optimizer], torch.optim.lr_scheduler.ConstantLR(optimizer), Progress(step=step))
+        manager.save(step, model, [optimizer], Progress(step=step))
         manager.wait()
         if clean:
             manager.maybe_clean()
@@ -70,7 +70,7 @@ def test_resumes_from_remote_when_disk_is_empty(tmp_path: Path, config: Checkpoi
 
     step = manager.resolve_latest_step()
     manager.prefetch(step)
-    manager.load(step, resumed_model, [resumed_optimizer], None, Progress())
+    manager.load(step, resumed_model, [resumed_optimizer], Progress())
     manager.close()
 
     assert all(torch.equal(a, b) for a, b in zip(model.state_dict().values(), resumed_model.state_dict().values()))
