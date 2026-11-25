@@ -85,52 +85,78 @@ def _partition_loads(weights: Sequence[int], partitions: list[list[int]]) -> lis
     return [sum(weights[i] for i in partition) for partition in partitions]
 
 
+_NO_OTHER_MAX, _NO_OTHER_MIN = np.iinfo(np.int64).min, np.iinfo(np.int64).max
+
+
+def _others_extreme(
+    relative: np.ndarray, ranked: np.ndarray, rank: int, partners: np.ndarray, empty: int
+) -> np.ndarray:
+    """For each partner, the first load in ``ranked`` order of a rank other than ``rank`` and that
+    partner (``empty`` when there is none): the max (or min) over the ranks a swap leaves alone."""
+    leading = ranked[:3]
+    allowed = (leading != rank) & (leading[None, :] != partners[:, None])
+    first = allowed.argmax(axis=1)
+    return np.where(allowed.any(axis=1), relative[leading[first]], empty)
+
+
 def _refine_by_swapping(weights: Sequence[int], partitions: list[list[int]]) -> list[list[int]]:
     """Apply the best pairwise swap until none lowers ``(max load, max - min load)``.
 
-    Ties go to the first swap in (rank pair, left position, right position) order.
-    Loads are taken relative to the current max load, so the int64 math stays within
-    the spread plus the largest weight even when total FLOPs exceed int64.
+    Ties go to the first swap in (rank pair, left position, right position) order. A swap
+    between two ranks that are neither at the max nor at the min load leaves both, so each
+    round scores only those ranks' swaps, with every other rank at once. Loads are taken
+    relative to the current max load, so the int64 math stays within the spread plus the
+    largest weight even when total FLOPs exceed int64.
     """
-    partitions = [list(partition) for partition in partitions]
-    loads = _partition_loads(weights, partitions)
-    item_weights = np.asarray(weights, dtype=np.int64)
     num_partitions = len(partitions)
-    no_other_max, no_other_min = np.iinfo(np.int64).min, np.iinfo(np.int64).max
+    if num_partitions < 2:
+        return [list(partition) for partition in partitions]
+    assert len({len(partition) for partition in partitions}) == 1, "Partitions must be the same size"
+    items = np.array(partitions, dtype=np.int64)
+    item_weights = np.asarray(weights, dtype=np.int64)[items]
+    loads = _partition_loads(weights, partitions)
 
     while True:
-        top = max(loads)
+        top, bottom = max(loads), min(loads)
         relative = np.array([load - top for load in loads], dtype=np.int64)
-        best_score = (0, top - min(loads))
-        best_swap = None
-        for left_rank in range(num_partitions):
-            for right_rank in range(left_rank + 1, num_partitions):
-                others = np.delete(relative, [left_rank, right_rank])
-                other_max = others.max() if len(others) else no_other_max
-                other_min = others.min() if len(others) else no_other_min
-                left_weights = item_weights[partitions[left_rank]][:, None]
-                right_weights = item_weights[partitions[right_rank]][None, :]
-                new_left = relative[left_rank] - left_weights + right_weights
-                new_right = relative[right_rank] - right_weights + left_weights
-                new_max = np.maximum(np.maximum(new_left, new_right), other_max)
-                lowest_max = int(new_max.min())
-                if lowest_max > best_score[0]:
-                    continue
-                new_min = np.minimum(np.minimum(new_left, new_right), other_min)
-                spread = np.where(new_max == lowest_max, new_max - new_min, no_other_min)
-                flat = int(spread.argmin())
-                score = (lowest_max, int(spread.flat[flat]))
-                if score < best_score:
-                    best_score = score
-                    best_swap = (left_rank, right_rank, *divmod(flat, right_weights.shape[1]))
-        if best_swap is None:
-            return partitions
+        ascending = np.argsort(relative, kind="stable")
+        descending = ascending[::-1]
+        # (new max, spread, rank pair, left position, right position) of the best swap so far
+        best: tuple[int, ...] | None = None
+        for rank in (rank for rank in range(num_partitions) if loads[rank] in (top, bottom)):
+            partners = np.delete(np.arange(num_partitions), rank)
+            other_max = _others_extreme(relative, descending, rank, partners, _NO_OTHER_MAX)[:, None, None]
+            other_min = _others_extreme(relative, ascending, rank, partners, _NO_OTHER_MIN)[:, None, None]
+            # [partner, position in rank, position in partner]
+            own = item_weights[rank][None, :, None]
+            theirs = item_weights[partners][:, None, :]
+            new_own = relative[rank] - own + theirs
+            new_theirs = relative[partners][:, None, None] - theirs + own
+            new_max = np.maximum(np.maximum(new_own, new_theirs), other_max)
+            lowest_max = new_max.min()
+            tied = new_max == lowest_max
+            spread = np.where(tied, new_max - np.minimum(np.minimum(new_own, new_theirs), other_min), _NO_OTHER_MIN)
+            least_spread = spread.min()
+            for partner_index, own_pos, their_pos in np.argwhere(spread == least_spread).tolist():
+                partner = int(partners[partner_index])
+                if rank < partner:
+                    swap = (int(lowest_max), int(least_spread), rank, partner, own_pos, their_pos)
+                else:
+                    swap = (int(lowest_max), int(least_spread), partner, rank, their_pos, own_pos)
+                if best is None or swap < best:
+                    best = swap
+        if best is None or best[:2] >= (0, top - bottom):
+            return items.tolist()
 
-        left_rank, right_rank, left_pos, right_pos = best_swap
-        left_idx, right_idx = partitions[left_rank][left_pos], partitions[right_rank][right_pos]
-        partitions[left_rank][left_pos], partitions[right_rank][right_pos] = right_idx, left_idx
-        loads[left_rank] += weights[right_idx] - weights[left_idx]
-        loads[right_rank] += weights[left_idx] - weights[right_idx]
+        _, _, left_rank, right_rank, left_pos, right_pos = best
+        left_weight, right_weight = int(item_weights[left_rank, left_pos]), int(item_weights[right_rank, right_pos])
+        items[left_rank, left_pos], items[right_rank, right_pos] = (
+            items[right_rank, right_pos],
+            items[left_rank, left_pos],
+        )
+        item_weights[left_rank, left_pos], item_weights[right_rank, right_pos] = right_weight, left_weight
+        loads[left_rank] += right_weight - left_weight
+        loads[right_rank] += left_weight - right_weight
 
 
 def balanced_partition(weights: Sequence[int], num_partitions: int) -> list[list[int]]:
@@ -151,14 +177,6 @@ def _has_routing(ref: SampleRef) -> bool:
 class _Bin:
     samples: list[SampleRef] = field(default_factory=list)
     length: int = 0
-
-    def can_add(self, sample: SampleRef, max_seq_len: int) -> bool:
-        # Loss routing is per token (component weight streams), so samples of
-        # different loss types and raw-image refs pack together freely.
-        if self.length + sample.num_tokens > max_seq_len:
-            return False
-        # Routing replays per micro batch: every sample in it has routing rows or none does.
-        return _has_routing(self.samples[0]) == _has_routing(sample)
 
     def add(self, sample: SampleRef) -> None:
         self.samples.append(sample)
@@ -208,13 +226,24 @@ def pack_samples(
     truncating; with several data ranks, split the heaviest bins until every rank gets one.
     Samples of any temperature, and multimodal samples with text ones, pack together."""
     bins: list[_Bin] = []
+    # Loss routing is per token (component weight streams), so samples of different loss types
+    # and raw-image refs pack together freely. Routing replays per micro batch: every sample in
+    # a bin has routing rows or none does, so a sample's first fit is the first bin of its
+    # routing class with room.
+    classes: dict[bool, list[_Bin]] = {False: [], True: []}
+    room = {routing: np.zeros(len(samples), dtype=np.int64) for routing in classes}
     for sample in sorted(samples, key=lambda sample: -sample.num_tokens):
-        for bin_content in bins:
-            if bin_content.can_add(sample, max_seq_len):
-                bin_content.add(sample)
-                break
+        routing = _has_routing(sample)
+        candidates = classes[routing]
+        fits = room[routing][: len(candidates)] >= sample.num_tokens
+        first = int(fits.argmax()) if len(candidates) else 0
+        if len(candidates) and fits[first]:
+            candidates[first].add(sample)
+            room[routing][first] -= sample.num_tokens
         else:
-            bins.append(_Bin([sample], sample.num_tokens))
+            room[routing][len(candidates)] = max_seq_len - sample.num_tokens
+            candidates.append(_Bin([sample], sample.num_tokens))
+            bins.append(candidates[-1])
 
     if num_train_workers > 1:
         target_count = max(
