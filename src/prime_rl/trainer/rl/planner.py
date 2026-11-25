@@ -1,10 +1,13 @@
-"""Packing a step's samples into per-rank micro batches, by reference.
+"""Planning a step's micro batches on every trainer rank.
 
-The orchestrator never holds a sample's tokens: it packs ``SampleRef``s by token count into
-``MicroBatchPlan``s, and each trainer rank builds its micro batches from the plans
-(``prime_rl.transports.batch.materialize``).
+The orchestrator ships a step's samples by reference (``StepBatch``). Every trainer rank plans
+the micro batches of all data ranks from them, packing ``SampleRef``s by token count into rows
+of at most ``seq_len`` tokens and balancing the rows' training FLOPs across the data ranks. The
+planning is deterministic, so every rank plans the same; each builds its own data rank's micro
+batches (``prime_rl.transports.batch.materialize``).
 """
 
+import hashlib
 import heapq
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -12,10 +15,6 @@ from dataclasses import dataclass, field
 import msgspec
 import numpy as np
 
-from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.configs.trainer import ModelConfig
-from prime_rl.trainer.model import get_model
-from prime_rl.trainer.perf import FlopCounter
 from prime_rl.transports.batch.types import MicroBatchPlan, SampleRef
 
 
@@ -219,7 +218,7 @@ def _expand_bins_by_splitting(bins: list[_Bin], target_count: int, bin_cost: Cal
 def pack_samples(
     samples: list[SampleRef],
     max_seq_len: int,
-    num_train_workers: int,
+    num_data_ranks: int,
     bin_cost: Callable[[Sequence[int]], int],
 ) -> list[_Bin]:
     """Pack samples into micro batches with First Fit Decreasing, minimizing padding while never
@@ -245,10 +244,10 @@ def pack_samples(
             candidates.append(_Bin([sample], sample.num_tokens))
             bins.append(candidates[-1])
 
-    if num_train_workers > 1:
+    if num_data_ranks > 1:
         target_count = max(
-            ((len(bins) + num_train_workers - 1) // num_train_workers) * num_train_workers,
-            num_train_workers,
+            ((len(bins) + num_data_ranks - 1) // num_data_ranks) * num_data_ranks,
+            num_data_ranks,
         )
         _expand_bins_by_splitting(bins, target_count, bin_cost)
     return bins
@@ -263,23 +262,23 @@ def sequence_lengths(plan: MicroBatchPlan) -> list[int]:
 
 def _distribute_group(
     group: list[MicroBatchPlan],
-    num_train_workers: int,
+    num_data_ranks: int,
     bin_cost: Callable[[Sequence[int]], int],
 ) -> list[list[MicroBatchPlan]]:
-    # Callers pad each group to a positive multiple of num_train_workers first.
-    assert len(group) % num_train_workers == 0, "Number of micro batches is not divisible by number of data ranks"
+    # Callers pad each group to a positive multiple of num_data_ranks first.
+    assert len(group) % num_data_ranks == 0, "Number of micro batches is not divisible by number of data ranks"
     if not group:
-        return [[] for _ in range(num_train_workers)]
+        return [[] for _ in range(num_data_ranks)]
 
     weights = [bin_cost(sequence_lengths(plan)) for plan in group]
-    partitions = balanced_partition(weights, num_train_workers)
+    partitions = balanced_partition(weights, num_data_ranks)
     return [[group[i] for i in partition] for partition in partitions]
 
 
-def _pad_group_for_distribution(group: list[MicroBatchPlan], num_train_workers: int) -> list[MicroBatchPlan]:
+def _pad_group_for_distribution(group: list[MicroBatchPlan], num_data_ranks: int) -> list[MicroBatchPlan]:
     """Pad a group of micro batches with zero-loss copies of its first so its length is
-    divisible by num_train_workers."""
-    num_padding = -len(group) % num_train_workers
+    divisible by num_data_ranks."""
+    num_padding = -len(group) % num_data_ranks
     if num_padding > 0 and len(group) > 0:
         dummy = msgspec.structs.replace(group[0], dummy=True)
         group.extend([dummy] * num_padding)
@@ -289,7 +288,7 @@ def _pad_group_for_distribution(group: list[MicroBatchPlan], num_train_workers: 
 def prepare_batch(
     samples: list[SampleRef],
     seq_len: int,
-    num_train_workers: int,
+    num_data_ranks: int,
     bin_cost: Callable[[Sequence[int]], int],
     *,
     trained_version: int,
@@ -305,7 +304,7 @@ def prepare_batch(
     and distribute them so that at each step index, all ranks see the same modality.
     """
     plans = []
-    for bin_content in pack_samples(samples, seq_len, num_train_workers, bin_cost):
+    for bin_content in pack_samples(samples, seq_len, num_data_ranks, bin_cost):
         padding = (pad_to_multiple_of - bin_content.length % pad_to_multiple_of) % pad_to_multiple_of
         plans.append(
             MicroBatchPlan(
@@ -320,38 +319,19 @@ def prepare_batch(
     mm_plans = [plan for plan in plans if any(sample.images for sample in plan.samples)]
     text_plans = [plan for plan in plans if not any(sample.images for sample in plan.samples)]
 
-    # Pad each group independently so its count is divisible by num_train_workers
-    mm_plans = _pad_group_for_distribution(mm_plans, num_train_workers)
-    text_plans = _pad_group_for_distribution(text_plans, num_train_workers)
+    # Pad each group independently so its count is divisible by num_data_ranks
+    mm_plans = _pad_group_for_distribution(mm_plans, num_data_ranks)
+    text_plans = _pad_group_for_distribution(text_plans, num_data_ranks)
 
-    plans_per_gpu: list[list[MicroBatchPlan]] = [[] for _ in range(num_train_workers)]
+    plans_per_gpu: list[list[MicroBatchPlan]] = [[] for _ in range(num_data_ranks)]
     for group in (mm_plans, text_plans):
-        for worker_idx, worker_plans in enumerate(_distribute_group(group, num_train_workers, bin_cost)):
+        for worker_idx, worker_plans in enumerate(_distribute_group(group, num_data_ranks, bin_cost)):
             plans_per_gpu[worker_idx].extend(worker_plans)
     return plans_per_gpu
 
 
-class BatchPacker:
-    """Bin-packs a step's training samples into one micro-batch plan list per trainer DP rank."""
-
-    def __init__(self, config: OrchestratorConfig):
-        self.seq_len = config.seq_len
-        self.num_train_workers = config.num_train_workers
-        # Rows hold at most `seq_len` tokens, so padding to a multiple of it pads every row to exactly `seq_len`
-        self.pad_to_multiple_of = config.seq_len if config.pad_to_seq_len else config.pad_to_multiple_of
-        # Built as the trainer builds it. The flash-attention version selects kernels, not modules.
-        model_config = ModelConfig(
-            name=config.model.name, attn="flash_attention_3", trust_remote_code=config.tokenizer.trust_remote_code
-        )
-        self.bin_cost = FlopCounter(get_model(model_config))
-
-    def pack(self, samples: list[SampleRef], *, trained_version: int, min_version: int) -> list[list[MicroBatchPlan]]:
-        return prepare_batch(
-            samples,
-            seq_len=self.seq_len,
-            num_train_workers=self.num_train_workers,
-            bin_cost=self.bin_cost,
-            trained_version=trained_version,
-            min_version=min_version,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-        )
+def plan_digest(plans_per_rank: list[list[MicroBatchPlan]]) -> int:
+    """A digest of a step's plans for every data rank: equal on every trainer rank that
+    planned the step the same."""
+    digest = hashlib.blake2b(msgspec.msgpack.encode(plans_per_rank), digest_size=7).digest()
+    return int.from_bytes(digest, "big")

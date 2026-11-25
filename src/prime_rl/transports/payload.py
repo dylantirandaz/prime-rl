@@ -6,8 +6,8 @@ each env worker (`PayloadHook`) builds every trainable branch's sample: its per-
 and training arrays (routing rows, sampling masks, top-k heads). It keeps the encoded
 `SampleBody` and serves it over HTTP; the trace carries only a reference and a small summary per
 branch in `trace.info[PAYLOAD_INFO_KEY]`. The orchestrator decides about samples from the
-summaries and ships `MicroBatchPlan`s of `SampleRef`s, and each trainer rank fetches its micro
-batches' bodies and builds them (`materialize_micro_batches`).
+summaries and ships the step's `SampleRef`s; each trainer rank plans the step's micro batches
+from them, fetches its own micro batches' bodies and builds them (`materialize_micro_batches`).
 
 Every kept body is deleted exactly once, by whoever holds it last: the trainer deletes a
 step's bodies once every rank fetched them; the orchestrator deletes the bodies of samples
